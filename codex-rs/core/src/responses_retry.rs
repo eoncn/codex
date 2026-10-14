@@ -17,11 +17,14 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
+use rand::Rng;
 use tokio::time::Instant;
 use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const CAPACITY_BASE_DELAY_SECS: u64 = 30;
+const CAPACITY_MAX_DELAY_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -30,6 +33,7 @@ pub(crate) enum ResponsesStreamRequest {
 }
 
 pub(crate) struct ResponsesStreamRetryState {
+    capacity_retries: u64,
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
@@ -38,6 +42,7 @@ pub(crate) struct ResponsesStreamRetryState {
 impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
+            capacity_retries: 0,
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
@@ -84,6 +89,41 @@ pub(crate) async fn handle_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
+    // Keep this sampling/foreground compaction turn active on overload (unattended development).
+    // Do not consume the ordinary stream retry budget or switch transports.
+    if matches!(err.details(), CodexErrorDetails::ServerOverloaded)
+        && capacity_retry_enabled()
+    {
+        retry_state.capacity_retries = retry_state.capacity_retries.saturating_add(1);
+        let attempt = retry_state.capacity_retries;
+        let delay = capacity_retry_delay(attempt);
+        let now = Instant::now();
+        let local_deadline = now + delay;
+        // Never retry earlier than either the local backoff or server advice.
+        let retry_at = err
+            .retry_after()
+            .map_or(local_deadline, |advice| local_deadline.max(advice.deadline()));
+        let actual_delay = retry_at.saturating_duration_since(now);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            attempt,
+            ?actual_delay,
+            "model overloaded; keeping turn alive and retrying"
+        );
+        codex_client::record_retry!(attempt, actual_delay, operation);
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Model at capacity: retry #{attempt} in {}s (Esc to cancel)",
+                actual_delay.as_secs()
+            ),
+            err,
+        )
+        .await;
+        tokio::time::sleep_until(retry_at).await;
+        return Ok(());
+    }
+
     let retry_count = retry_state.retries.saturating_add(1);
     let Some(delay) = err.retry_delay(retry_count) else {
         return Err(err);
@@ -173,6 +213,23 @@ pub(crate) async fn handle_response_stream_error(
             retry_at: retry_after.map(RetryAfter::deadline),
         });
     Err(err)
+}
+
+pub(crate) fn capacity_retry_enabled() -> bool {
+    // Enabled by default for unattended AI development; set CODEX_CAPACITY_RETRY_FOREVER=0 to disable.
+    std::env::var("CODEX_CAPACITY_RETRY_FOREVER").map_or(true, |value| value != "0")
+}
+
+fn capacity_retry_base_secs(attempt: u64) -> u64 {
+    let shift = attempt.saturating_sub(1).min(4) as u32;
+    (CAPACITY_BASE_DELAY_SECS << shift).min(CAPACITY_MAX_DELAY_SECS)
+}
+
+pub(crate) fn capacity_retry_delay(attempt: u64) -> Duration {
+    let base_secs = capacity_retry_base_secs(attempt);
+    // Positive jitter (0-10%) avoids synchronized retry storms.
+    let jitter_ms = rand::rng().random_range(0..=(base_secs * 100));
+    Duration::from_secs(base_secs) + Duration::from_millis(jitter_ms)
 }
 
 fn log_retry(

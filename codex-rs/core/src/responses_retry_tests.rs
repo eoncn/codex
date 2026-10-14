@@ -1,5 +1,8 @@
 use super::ResponsesStreamRequest;
 use super::ResponsesStreamRetryState;
+use super::capacity_retry_base_secs;
+use super::capacity_retry_delay;
+use super::capacity_retry_enabled;
 use super::handle_response_stream_error;
 use super::log_retry;
 use crate::realtime_history::RealtimeHistoryState;
@@ -12,6 +15,29 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing_test::internal::MockWriter;
+
+#[test]
+fn capacity_retry_backoff_is_bounded_but_attempts_are_not() {
+    for (attempt, expected_secs) in [
+        (1, 30),
+        (2, 60),
+        (3, 120),
+        (4, 240),
+        (5, 300),
+        (100, 300),
+        (u64::MAX, 300),
+    ] {
+        assert_eq!(capacity_retry_base_secs(attempt), expected_secs);
+    }
+    let wait = capacity_retry_delay(5);
+    assert!(wait >= Duration::from_secs(300));
+    assert!(wait <= Duration::from_secs(330));
+}
+
+#[test]
+fn capacity_retry_enabled_defaults_to_true() {
+    assert!(capacity_retry_enabled());
+}
 
 #[tokio::test]
 async fn sampling_retry_logs_stream_error_context() {

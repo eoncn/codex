@@ -19,6 +19,8 @@ use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::capacity_retry_delay;
+use crate::responses_retry::capacity_retry_enabled;
 use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -293,6 +295,7 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    let mut capacity_retries = 0u64;
     // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
     // request tracking) survives retries within this compact turn.
     let mut client_session = sess.services.model_client.new_session();
@@ -368,6 +371,29 @@ async fn run_compact_task_inner_impl(
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 return Err(e);
+            }
+            Err(e)
+                if capacity_retry_enabled()
+                    && matches!(e.details(), CodexErrorDetails::ServerOverloaded) =>
+            {
+                capacity_retries = capacity_retries.saturating_add(1);
+                let now = tokio::time::Instant::now();
+                let deadline = now + capacity_retry_delay(capacity_retries);
+                let retry_at = e
+                    .retry_after()
+                    .map_or(deadline, |advice| deadline.max(advice.deadline()));
+                let wait = retry_at.saturating_duration_since(now);
+                sess.notify_stream_error(
+                    turn_context.as_ref(),
+                    format!(
+                        "Model at capacity during compaction: retry #{capacity_retries} in {}s",
+                        wait.as_secs()
+                    ),
+                    e,
+                )
+                .await;
+                tokio::time::sleep_until(retry_at).await;
+                continue;
             }
             Err(e) => {
                 if retries < max_retries {
