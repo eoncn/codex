@@ -1,8 +1,6 @@
 name: Build Windows Codex Binary
 
 on:
-  push:
-    branches: [ "**" ]
   workflow_dispatch:
 
 jobs:
