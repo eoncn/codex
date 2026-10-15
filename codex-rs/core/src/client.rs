@@ -1004,8 +1004,15 @@ impl ModelClient {
             prefix.push(instructions);
         }
         input.splice(0..0, prefix);
-        if !model_info.use_responses_lite {
-            // Only RLite accepts per-content attribution until the Responses API schema expands.
+        if model_info.use_responses_lite && is_openai {
+            // The ChatGPT Codex backend can reject content_item_metadata in
+            // Responses Lite requests. Mirror --disable content_item_kinds for
+            // this request copy while preserving the metadata in local history.
+            for item in &mut input {
+                item.clear_content_item_kinds();
+            }
+        } else if !model_info.use_responses_lite {
+            // Standard Responses does not accept per-content attribution.
             for item in &mut input {
                 item.clear_content_item_metadata();
             }

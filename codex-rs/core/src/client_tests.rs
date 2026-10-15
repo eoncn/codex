@@ -1091,6 +1091,81 @@ async fn responses_http_preserves_raw_tool_metadata_for_openai_custom_endpoint()
 
 #[test_case::test_case(false; "standard")]
 #[test_case::test_case(true; "responses_lite")]
+fn openai_request_omits_unsupported_content_attribution(
+    responses_lite: bool,
+) -> anyhow::Result<()> {
+    let mut client = test_model_client(SessionSource::Cli);
+    let provider = ModelProviderInfo::create_openai_provider(Some(
+        "https://chatgpt.com/backend-api/codex".to_string(),
+    ));
+    Arc::get_mut(&mut client.state)
+        .expect("test client should have unique session state")
+        .provider = create_model_provider(provider, /*auth_manager*/ None);
+
+    let item: ResponseItem = serde_json::from_value(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn-1",
+            "content_item_kinds": ["user_input"],
+            "content_item_metadata": [{"provenance": {"type": "user"}}]
+        }
+    }))?;
+    let prompt = Prompt {
+        input: vec![item.clone()],
+        ..Default::default()
+    };
+    let mut model = test_model_info();
+    model.use_responses_lite = responses_lite;
+    let request = client.build_responses_request(
+        &prompt,
+        &model,
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        ),
+        /*include_internal*/ true,
+    )?;
+
+    let wire = serde_json::to_value(&request)?;
+    let user_message = wire["input"]
+        .as_array()
+        .expect("request input array")
+        .iter()
+        .find(|item| item["role"] == "user")
+        .expect("user input item");
+    let metadata = &user_message["internal_chat_message_metadata_passthrough"];
+    assert_eq!(metadata["turn_id"], "turn-1");
+    assert!(
+        metadata.get("content_item_metadata").is_none(),
+        "Responses request must not send unsupported content attribution"
+    );
+    if responses_lite {
+        assert!(
+            metadata.get("content_item_kinds").is_none(),
+            "ChatGPT Responses Lite must not send unsupported classifications"
+        );
+    } else {
+        assert_eq!(metadata["content_item_kinds"], json!(["user_input"]));
+    }
+    // The request-only workaround must not erase the original history.
+    let original = serde_json::to_value(&item)?;
+    assert!(original["internal_chat_message_metadata_passthrough"]
+        .get("content_item_metadata")
+        .is_some());
+    assert_eq!(prompt.input, vec![item]);
+    Ok(())
+}
+
+#[test_case::test_case(false; "standard")]
+#[test_case::test_case(true; "responses_lite")]
 fn prefix_ids_track_thread_and_payload(responses_lite: bool) -> anyhow::Result<()> {
     let thread_id = ThreadId::new();
     let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
