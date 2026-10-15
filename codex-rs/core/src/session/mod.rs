@@ -53,7 +53,6 @@ use crate::session::step_settings::ResolvedStepSettings;
 use crate::session::step_settings::StepSettings;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::SnapshotCredentialBrokerState;
-use crate::skills_load_input_from_config;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
@@ -189,6 +188,7 @@ use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreResumePreparation;
 use codex_utils_audio::prepare_response_items as prepare_audio_response_items;
 use codex_utils_git_discovery::GitRootDiscovery;
 use codex_utils_output_truncation::with_serialization_allowance;
@@ -496,6 +496,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
+    pub(crate) resume_preparation: Option<ThreadStoreResumePreparation>,
     pub(crate) history_initialization: HistoryInitialization,
     pub(crate) disabled_plugin_ids: Option<Vec<String>>,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
@@ -611,6 +612,7 @@ impl Session {
             code_mode_session_provider,
             extensions,
             conversation_history,
+            resume_preparation,
             history_initialization,
             disabled_plugin_ids,
             requested_history_mode,
@@ -992,6 +994,7 @@ impl Session {
             analytics_events_client,
             image_store,
             thread_store,
+            resume_preparation,
             parent_rollout_thread_trace,
             attestation_provider,
             external_time_provider,

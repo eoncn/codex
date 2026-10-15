@@ -987,6 +987,28 @@ impl App {
             }
             return;
         }
+        // Dismissing the initial agents overview can expose /new before any folder consent.
+        // Resolve trust before loading defaults and applying explicit permission choices.
+        if self.current_displayed_thread_id().is_none() {
+            let mut config = self.chat_widget.config_ref().clone();
+            let cwd = config.cwd.to_path_buf();
+            if let Err(control) = self
+                .confirm_directory_trust(
+                    tui,
+                    app_server,
+                    &mut config,
+                    &cwd,
+                    crate::onboarding::DirectoryTrustOptions::default(),
+                    /*startup_draft*/ None,
+                )
+                .await
+            {
+                if matches!(control, AppRunControl::Exit(_)) {
+                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                }
+                return;
+            }
+        }
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
         // until the new session is configured and any replayed turns have been rendered.

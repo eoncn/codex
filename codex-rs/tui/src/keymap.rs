@@ -413,6 +413,20 @@ impl ListKeymap {
         .find(|action| self.bindings_for(*action).is_pressed(event))
     }
 
+    /// Resolve only vertical navigation, preserving its historical priority.
+    pub(crate) fn vertical_action_for(&self, event: KeyEvent) -> Option<ListAction> {
+        [
+            ListAction::MoveUp,
+            ListAction::MoveDown,
+            ListAction::PageUp,
+            ListAction::PageDown,
+            ListAction::JumpTop,
+            ListAction::JumpBottom,
+        ]
+        .into_iter()
+        .find(|action| self.bindings_for(*action).is_pressed(event))
+    }
+
     pub(crate) fn has_chord_prefix(&self, event: KeyEvent) -> bool {
         self.chord_hints.bindings.iter().any(|binding| {
             binding.action.context.overlaps(KeymapContext::List)

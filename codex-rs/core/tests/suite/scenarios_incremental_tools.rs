@@ -2,6 +2,10 @@
 
 use anyhow::Result;
 use codex_features::Feature;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
+use codex_otel::TOOL_INCREMENTAL_UPDATES_METRIC;
+use codex_otel::TOOL_SPEC_DESCRIPTION_BYTES_METRIC;
 use codex_protocol::openai_models::CodeModeToolMessages;
 use codex_protocol::openai_models::IncrementalToolMessages;
 use codex_protocol::openai_models::ToolMessage;
@@ -17,8 +21,13 @@ use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
+use opentelemetry_sdk::metrics::data::ScopeMetrics;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::BTreeMap;
 use test_case::test_case;
 
 use super::super::rmcp_client::remote_aware_environment_id;
@@ -52,7 +61,16 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
             .collect(),
     )
     .await;
-    let test = test_codex()
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-core",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )?;
+    let mut test = test_codex()
         .with_model_info_override("gpt-5.4", move |model| {
             model.use_responses_lite = use_responses_lite;
             model.tool_mode = Some(ToolMode::CodeMode);
@@ -106,6 +124,12 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
         })
         .build_with_auto_env(&server)
         .await?;
+    let mut options = test.start_thread_options().await;
+    options.thread_extension_init.insert(metrics.clone());
+    let thread = test.thread_manager.start_thread(options).await?;
+    test.codex.shutdown_and_wait().await?;
+    test.codex = thread.thread;
+    test.session_configured = thread.session_configured;
     test.submit_turn("Begin work.").await?;
     test.submit_turn("Continue with the same tools.").await?;
     core_test_support::submit_thread_settings(
@@ -130,6 +154,74 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
     }
 
     let requests = mock.requests();
+    assert_eq!(requests.len(), if use_responses_lite { 6 } else { 4 });
+    let snapshot = metrics.snapshot()?;
+    let mut counts = BTreeMap::<_, u64>::new();
+    let mut bytes = BTreeMap::new();
+    for metric in snapshot.scope_metrics().flat_map(ScopeMetrics::metrics) {
+        match metric.name() {
+            TOOL_INCREMENTAL_UPDATES_METRIC => {
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    panic!("tool updates must be a counter");
+                };
+                for point in sum.data_points() {
+                    let tags = point
+                        .attributes()
+                        .map(|tag| (tag.key.as_str(), tag.value.to_string()))
+                        .collect::<BTreeMap<_, _>>();
+                    *counts
+                        .entry((tags["action"].clone(), tags["tool"].clone()))
+                        .or_default() += point.value();
+                }
+            }
+            TOOL_SPEC_DESCRIPTION_BYTES_METRIC => {
+                let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                    panic!("tool description bytes must be a histogram");
+                };
+                for point in histogram.data_points() {
+                    let tool = point
+                        .attributes()
+                        .find(|tag| tag.key.as_str() == "tool")
+                        .expect("tool tag")
+                        .value
+                        .to_string();
+                    let sample = bytes.entry(tool).or_insert((0, 0.0));
+                    sample.0 += point.count();
+                    sample.1 += point.sum();
+                }
+            }
+            _ => {}
+        }
+    }
+    if use_responses_lite {
+        let body = requests[2].body_json();
+        let exec = body["input"]
+            .as_array()
+            .expect("request input")
+            .iter()
+            .rev()
+            .filter(|item| item["type"] == "additional_tools")
+            .find_map(|item| responses::namespace_child_tool(item, "functions", "exec"))
+            .expect("changed exec definition");
+        let description_bytes = exec["description"]
+            .as_str()
+            .expect("exec description")
+            .len() as f64;
+        assert_eq!(
+            counts,
+            BTreeMap::from([(
+                ("schema_changed".to_string(), "functions.exec".to_string()),
+                1
+            )])
+        );
+        assert_eq!(
+            bytes,
+            BTreeMap::from([("functions.exec".to_string(), (1, description_bytes))])
+        );
+    } else {
+        assert_eq!(counts, BTreeMap::new());
+        assert_eq!(bytes, BTreeMap::new());
+    }
     if use_responses_lite {
         for request in &requests[..5] {
             assert_eq!(
@@ -161,6 +253,7 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
                 .include_request_settings(),
         )
     );
+    metrics.shutdown()?;
     Ok(())
 }
 

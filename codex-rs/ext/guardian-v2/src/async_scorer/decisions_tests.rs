@@ -41,21 +41,46 @@ fn adapter_rejects_unsupported_evidence() {
             &[user.clone(), trusted],
             /*parent_compaction*/ None
         ),
-        Err(DecisionsError::UnsupportedEvidence)
+        Err(DecisionsError::UnsupportedDeveloperMessage)
     );
+    for role in ["assistant", "system", "unknown"] {
+        let item = serde_json::from_value(json!({
+            "type":"message", "role":role,
+            "content":[{"type":"input_text", "text":"evidence"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            request_body(&rubric, &[item], /*parent_compaction*/ None),
+            Err(DecisionsError::UnsupportedNonUserMessage)
+        );
+    }
     assert_eq!(
         request_body(&rubric, std::slice::from_ref(&user), Some(&user)),
         Err(DecisionsError::UnsupportedEvidence)
     );
-    let image: ResponseItem =
-        serde_json::from_value(json!({"type":"message", "role":"user", "content":[
-            {"type":"input_image", "image_url":"https://example.com/image.png"}
-        ]}))
+    for (content, expected_error) in [
+        (
+            json!({"type":"input_image", "image_url":"https://example.com/image.png"}),
+            DecisionsError::UnsupportedImage,
+        ),
+        (
+            json!({"type":"input_audio", "audio_url":"data:audio/wav;base64,AA=="}),
+            DecisionsError::UnsupportedAudio,
+        ),
+        (
+            json!({"type":"output_text", "text":"text"}),
+            DecisionsError::UnsupportedEvidence,
+        ),
+    ] {
+        let evidence: ResponseItem = serde_json::from_value(json!({
+            "type":"message", "role":"user", "content":[content]
+        }))
         .unwrap();
-    assert_eq!(
-        request_body(&rubric, &[image], /*parent_compaction*/ None),
-        Err(DecisionsError::UnsupportedEvidence)
-    );
+        assert_eq!(
+            request_body(&rubric, &[evidence], /*parent_compaction*/ None),
+            Err(expected_error)
+        );
+    }
 }
 
 #[test]
@@ -108,6 +133,10 @@ fn adapter_preserves_trusted_tool_authority_and_scope() {
             json!({"content_item_kinds": [TrustedTool::KIND, TrustedTool::KIND]}),
         ),
         (
+            "internal_chat_message_metadata_passthrough",
+            json!({"content_item_kinds": [TrustedTool::KIND, TrustedSkills::KIND]}),
+        ),
+        (
             "content",
             json!([
                 {"type": "input_text", "text": "Tool identity"},
@@ -119,12 +148,21 @@ fn adapter_preserves_trusted_tool_authority_and_scope() {
             json!([{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]),
         ),
     ] {
+        let expected_error = if field == "internal_chat_message_metadata_passthrough"
+            && replacement["content_item_kinds"][0] == TrustedSkills::KIND
+        {
+            DecisionsError::UnsupportedTrustedSkills
+        } else if field == "role" {
+            DecisionsError::UnsupportedNonUserMessage
+        } else {
+            DecisionsError::UnsupportedDeveloperMessage
+        };
         let mut unsupported = trusted.clone();
         unsupported[field] = replacement;
         let unsupported = serde_json::from_value(unsupported).unwrap();
         assert_eq!(
             request_body(&rubric, &[unsupported], /*parent_compaction*/ None),
-            Err(DecisionsError::UnsupportedEvidence)
+            Err(expected_error)
         );
     }
 }

@@ -276,6 +276,64 @@ async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<(
 }
 
 #[tokio::test]
+async fn program_status_acknowledges_deliberate_mouse_events() -> Result<()> {
+    use crate::terminal_program_status::ProgramStatus;
+    use crossterm::event::MouseButton;
+    use crossterm::event::MouseEvent;
+    use crossterm::event::MouseEventKind;
+
+    let mut app = make_test_app().await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let thread_id = ThreadId::new();
+    for (turn_status, expected) in [
+        (TurnStatus::Completed, ProgramStatus::Done),
+        (TurnStatus::Failed, ProgramStatus::Error),
+    ] {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            app.chat_widget.handle_server_notification(
+                turn_started_notification(thread_id, "result"),
+                /*replay_kind*/ None,
+            );
+            app.chat_widget.handle_server_notification(
+                turn_completed_notification(thread_id, "result", turn_status.clone()),
+                /*replay_kind*/ None,
+            );
+            let before = app.chat_widget.desired_program_status();
+            let mut mouse = MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Mouse(mouse))
+                .await?;
+            let after_hover = app.chat_widget.desired_program_status();
+            mouse.kind = kind;
+            app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Mouse(mouse))
+                .await?;
+            assert_eq!(
+                [
+                    before,
+                    after_hover,
+                    app.chat_widget.desired_program_status()
+                ],
+                [expected, expected, ProgramStatus::Idle],
+                "after {turn_status:?}, {kind:?}",
+            );
+        }
+    }
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn duplicate_named_resume_renders_error_without_replacing_current_session() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let label = format!("duplicate-{}", ThreadId::new());

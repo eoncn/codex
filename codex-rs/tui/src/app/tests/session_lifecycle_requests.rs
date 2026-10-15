@@ -4589,6 +4589,16 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     let source = codex_utils_path_uri::PathUri::from_abs_path(&agents.abs());
     assert!(configured.instruction_source_paths.contains(&source));
     assert_eq!(configured.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    let earlier_skills_requests = recorded_params(&requests, "skills/list");
+    app.submit_active_thread_op(
+        &mut server,
+        AppCommand::list_skills(vec![current.clone()], /*force_reload*/ true),
+    )
+    .await?;
+    assert_eq!(
+        recorded_params(&requests, "skills/list"),
+        earlier_skills_requests
+    );
     let (cwd, result) = (current.clone(), Err("stale skills".into()));
     let skills = AppEvent::SkillsListLoaded { cwd, result };
     let (cwd, plugins) = (current.clone(), Some(vec![]));
