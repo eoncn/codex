@@ -1,0 +1,49 @@
+name: Build Windows Codex Binary
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build codex.exe (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Codex Windows Package
+        shell: pwsh
+        run: |
+          $env:CODEX_REPO_ROOT = (Get-Location).Path
+          python scripts/build_codex_package.py `
+            --target x86_64-pc-windows-msvc `
+            --cargo-profile release `
+            --package-dir "$env:RUNNER_TEMP\codex-package" `
+            --force
+
+      - name: Verify packaged Codex version
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP "codex-package"
+          $manifest = Get-Content (Join-Path $packageDir "codex-package.json") -Raw | ConvertFrom-Json
+          $versionOutput = & (Join-Path $packageDir "bin/codex.exe") --version
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($manifest.version)) {
+            throw "Packaged codex.exe version '$versionOutput' does not match manifest version '$($manifest.version)'"
+          }
+
+      - name: Upload complete Windows Codex package
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-windows-x64
+          path: ${{ runner.temp }}/codex-package/
+          if-no-files-found: error
