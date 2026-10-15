@@ -31,11 +31,19 @@ jobs:
             --package-dir "$env:RUNNER_TEMP\codex-package" `
             --force
 
-      - name: Upload codex.exe artifact
+      - name: Verify packaged Codex version
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP "codex-package"
+          $manifest = Get-Content (Join-Path $packageDir "codex-package.json") -Raw | ConvertFrom-Json
+          $versionOutput = & (Join-Path $packageDir "bin/codex.exe") --version
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($manifest.version)) {
+            throw "Packaged codex.exe version '$versionOutput' does not match manifest version '$($manifest.version)'"
+          }
+
+      - name: Upload complete Windows Codex package
         uses: actions/upload-artifact@v4
         with:
           name: codex-windows-x64
-          path: |
-            ${{ runner.temp }}/codex-package/bin/codex.exe
-            ${{ runner.temp }}/codex-package/bin/*.exe
+          path: ${{ runner.temp }}/codex-package/
           if-no-files-found: error
