@@ -1,0 +1,91 @@
+name: Build macOS Intel Codex Package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-intel:
+    name: Build Codex (macOS Intel x64)
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify native Intel runner
+        shell: bash
+        run: |
+          test "$(uname -m)" = "x86_64"
+          rustc --version
+          cargo --version
+
+      - name: Build complete Intel macOS package
+        shell: bash
+        env:
+          CODEX_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 scripts/build_codex_package.py \
+            --target x86_64-apple-darwin \
+            --cargo-profile release \
+            --package-dir "$RUNNER_TEMP/codex-package" \
+            --archive-output "$RUNNER_TEMP/codex-macos-intel.tar.gz" \
+            --force
+
+      - name: Verify packaged binary, manifest and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tarfile
+          import tomllib
+
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          package_dir = root / "codex-package"
+          archive = root / "codex-macos-intel.tar.gz"
+          manifest = json.loads((package_dir / "codex-package.json").read_text())
+          version = tomllib.loads(pathlib.Path("codex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"]
+
+          assert manifest["version"] == version, manifest
+          assert manifest["target"] == "x86_64-apple-darwin", manifest
+          assert manifest["entrypoint"] == "bin/codex", manifest
+          for relative in ["bin/codex", "bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg"]:
+              binary = package_dir / relative
+              assert binary.is_file() and os.access(binary, os.X_OK), binary
+
+          output = subprocess.check_output([str(package_dir / "bin/codex"), "--version"], text=True).strip()
+          assert version in output, (output, version)
+          assert archive.is_file() and archive.stat().st_size > 0, archive
+          with tarfile.open(archive, "r:gz") as tar:
+              for relative in ["bin/codex", "bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg", "codex-package.json"]:
+                  member = tar.getmember(relative)
+                  assert member.isfile(), relative
+                  if relative != "codex-package.json":
+                      assert member.mode & 0o111, relative
+          print(f"Verified Codex {version} for Intel macOS: {output}")
+          PY
+          file "$RUNNER_TEMP/codex-package/bin/codex" | grep -q 'x86_64'
+
+      - name: Upload Intel macOS Codex archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-macos-intel-x64
+          path: ${{ runner.temp }}/codex-macos-intel.tar.gz
+          if-no-files-found: error
