@@ -1,3 +1,4 @@
+use codex_app_server_protocol::ApplicationStorageRequirements;
 use std::sync::Arc;
 
 use crate::config_manager::ConfigManager;
@@ -5,6 +6,7 @@ use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::model_catalog::ModelCatalog;
+use crate::otel_config::map_otel_requirements_to_api;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
@@ -71,6 +73,7 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
     "codex_apps_mcp_2026_07_28",
     "mcp_2026_07_28",
+    "mcp_connection_sharing",
     "memories",
     "mentions_v2",
     "remote_control",
@@ -374,6 +377,7 @@ pub(super) async fn reload_user_config(
 }
 
 async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager: &ThreadManager) {
+    config_manager.revoke_mcp_ema_startups();
     if let Err(err) = config_manager.load_config_layers(/*cwd*/ None).await {
         tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
         for thread_id in thread_manager.list_thread_ids().await {
@@ -438,7 +442,7 @@ async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager
     }
 }
 
-fn map_requirements_to_api(
+pub(crate) fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
     allowed_login_methods: Vec<ForcedLoginMethod>,
 ) -> Option<ConfigRequirements> {
@@ -449,6 +453,12 @@ fn map_requirements_to_api(
         }
         None => ConfigRequirementsToml::default(),
     };
+    let network = requirements
+        .permissions
+        .as_ref()
+        .and_then(|permissions| permissions.network.as_deref())
+        .cloned()
+        .or_else(|| requirements.network.clone());
 
     Some(ConfigRequirements {
         model_provider: requirements.model_provider,
@@ -461,6 +471,14 @@ fn map_requirements_to_api(
         allowed_login_methods: Some(allowed_login_methods),
         application: requirements.application.map(|application| {
             codex_app_server_protocol::ApplicationRequirements {
+                storage: application
+                    .storage
+                    .map(|storage| ApplicationStorageRequirements {
+                        default_project_parent: storage.default_project_parent.map(Into::into),
+                        projectless_workspace_root: storage
+                            .projectless_workspace_root
+                            .map(Into::into),
+                    }),
                 network: application.network.map(|network| {
                     codex_app_server_protocol::ApplicationNetworkRequirements {
                         enabled: network.enabled,
@@ -559,11 +577,14 @@ fn map_requirements_to_api(
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
-        hooks: requirements.hooks.map(map_hooks_requirements_to_api),
+        hooks: requirements
+            .hooks
+            .map(map_hooks_requirements_to_api)
+            .map(Box::new),
         enforce_residency: requirements
             .enforce_residency
             .map(map_residency_requirement_to_api),
-        network: requirements.network.map(map_network_requirements_to_api),
+        network: network.map(map_network_requirements_to_api),
         auto_review: requirements
             .auto_review
             .map(|auto_review| AutoReviewRequirements {
@@ -577,6 +598,9 @@ fn map_requirements_to_api(
                 service_tier: new_thread.service_tier,
             }),
         }),
+        otel: requirements
+            .otel
+            .map(|otel| map_otel_requirements_to_api(*otel)),
         sqlite_home: requirements.sqlite_home.map(Into::into),
         log_dir: requirements.log_dir.map(Into::into),
         model_catalog_json: requirements.model_catalog_json.map(Into::into),
@@ -714,6 +738,8 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         hooks,
     } = hooks;
     let HookEventsToml {
+        pre_model_request,
+        post_model_request,
         pre_tool_use,
         permission_request,
         post_tool_use,
@@ -726,11 +752,13 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_stop,
         stop,
         interrupt,
-    } = hooks;
+    } = *hooks;
 
     ManagedHooksRequirements {
         managed_dir,
         windows_managed_dir,
+        pre_model_request: map_hook_matcher_groups_to_api(pre_model_request),
+        post_model_request: map_hook_matcher_groups_to_api(post_model_request),
         pre_tool_use: map_hook_matcher_groups_to_api(pre_tool_use),
         permission_request: map_hook_matcher_groups_to_api(permission_request),
         post_tool_use: map_hook_matcher_groups_to_api(post_tool_use),
@@ -851,6 +879,7 @@ fn map_network_requirements_to_api(
                 })
                 .collect()
         }),
+        review_domains: network.review_domains,
         managed_allowed_domains_only: network.managed_allowed_domains_only,
         allowed_domains,
         denied_domains,

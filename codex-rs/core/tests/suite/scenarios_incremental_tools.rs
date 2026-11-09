@@ -1,10 +1,14 @@
-//! Request-history coverage for opt-in incremental tools on Responses Lite.
+//! Request-history coverage for incremental tools on Responses Lite.
 
 use anyhow::Result;
+use codex_core::ForkSnapshot;
+use codex_core::McpServersDisabled;
+use codex_core::compact::AutoCompactionDisabled;
 use codex_features::Feature;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::TOOL_INCREMENTAL_UPDATES_METRIC;
+use codex_otel::TOOL_REGISTRATIONS_METRIC;
 use codex_otel::TOOL_SPEC_DESCRIPTION_BYTES_METRIC;
 use codex_protocol::openai_models::CodeModeToolMessages;
 use codex_protocol::openai_models::IncrementalToolMessages;
@@ -33,11 +37,124 @@ use test_case::test_case;
 use super::super::rmcp_client::remote_aware_environment_id;
 use super::super::rmcp_client::remote_aware_stdio_server_bin;
 
-#[test_case(true; "responses_lite")]
-#[test_case(false; "responses_api")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prediction_fork_keeps_inherited_tools() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mcp = serde_json::from_value(json!({
+        "command": remote_aware_stdio_server_bin()?,
+        "environment_id": remote_aware_environment_id(),
+        "enabled_tools": ["echo"],
+        "required": true,
+    }))?;
+    let mut test = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = true;
+            model.supports_search_tool = false;
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+        })
+        .with_config(move |config| {
+            config.workspace_roots = vec![config.cwd.clone()];
+            config.base_instructions = Some("Use the available tools to help the user.".into());
+            config
+                .features
+                .enable(Feature::IncrementalTools)
+                .expect("enable incremental tools");
+            config
+                .mcp_servers
+                .set(std::collections::HashMap::from([(
+                    "echo_service".into(),
+                    mcp,
+                )]))
+                .expect("set MCP server");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "echo_service").await?;
+    let mock = responses::mount_sse_sequence(
+        &server,
+        ["parent", "prediction", "continued-parent"]
+            .into_iter()
+            .map(|id| responses::sse(vec![responses::ev_completed(id)]))
+            .collect(),
+    )
+    .await;
+    test.submit_text_turn("Start with the echo service.")
+        .await?;
+
+    let parent = std::sync::Arc::clone(&test.codex);
+    parent.flush_rollout().await?;
+    let (mut options, settings) = test
+        .thread_manager
+        .fork_options_from_parent(test.session_configured.thread_id)
+        .await?;
+    // Match experimentalPredictionMode with experimentalDisablePredictionMcp enabled.
+    options.config.ephemeral = true;
+    options
+        .config
+        .features
+        .enable(Feature::ReasoningEffortOverride)?;
+    options.thread_extension_init.insert(AutoCompactionDisabled);
+    options.thread_extension_init.insert(McpServersDisabled);
+    let child = test
+        .thread_manager
+        .fork_legacy_thread(
+            ForkSnapshot::Interrupted,
+            options,
+            parent.rollout_path().expect("parent rollout"),
+        )
+        .await?;
+    child.thread.restore_thread_settings(settings).await?;
+    test.codex = child.thread;
+    test.submit_text_turn("Predict the next message.").await?;
+    test.codex = parent;
+    test.submit_text_turn("Continue using the echo service.")
+        .await?;
+
+    let requests = mock.requests();
+    let parent = requests[0].body_json();
+    let child = requests[1].body_json();
+    let prefix = parent["input"].as_array().expect("parent input");
+    let exec = prefix
+        .iter()
+        .filter(|item| item["type"] == "additional_tools")
+        .find_map(|item| responses::namespace_child_tool(item, "functions", "exec"))
+        .expect("parent declares functions.exec");
+    assert!(
+        exec["description"]
+            .as_str()
+            .expect("exec description")
+            .contains("mcp__echo_service__echo"),
+        "the inherited functions.exec must describe the MCP helper",
+    );
+    assert_eq!(
+        &child["input"].as_array().expect("child input")[..prefix.len()],
+        prefix
+    );
+    insta::assert_snapshot!(
+        "prediction_fork_inherited_tools",
+        context_snapshot::format_request_history_snapshot(
+            "Request 1 starts the parent thread. Request 2 is the prediction child's only turn. Request 3 continues the original parent and verifies that it still has its MCP tools.",
+            &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
+#[test_case(true, None; "responses_lite")]
+#[test_case(true, Some(true); "announcements_suppressed")]
+#[test_case(false, None; "responses_api")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_tools_append_changed_catalog_without_rewriting_history(
     use_responses_lite: bool,
+    suppress_model_change_announcements: Option<bool>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
@@ -84,10 +201,12 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
             }
         })
         .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::IncrementalTools)
-                .expect("enable incremental tools");
+            if let Some(suppress) = suppress_model_change_announcements {
+                config
+                    .features
+                    .set_enabled(Feature::SuppressModelChangeAnnouncements, suppress)
+                    .expect("configure model announcements");
+            }
             if !use_responses_lite {
                 config.base_instructions =
                     Some("Use the available tools to help the user.".to_string());
@@ -156,10 +275,26 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
     let requests = mock.requests();
     assert_eq!(requests.len(), if use_responses_lite { 6 } else { 4 });
     let snapshot = metrics.snapshot()?;
+    let mut registration_samples = 0;
     let mut counts = BTreeMap::<_, u64>::new();
     let mut bytes = BTreeMap::new();
     for metric in snapshot.scope_metrics().flat_map(ScopeMetrics::metrics) {
         match metric.name() {
+            TOOL_REGISTRATIONS_METRIC => {
+                let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                    panic!("tool registrations must be a histogram");
+                };
+                for point in histogram.data_points() {
+                    registration_samples += point.count();
+                    assert_eq!(
+                        point
+                            .attributes()
+                            .find(|tag| tag.key.as_str() == "incremental_tools")
+                            .map(|tag| tag.value.to_string()),
+                        Some(use_responses_lite.to_string())
+                    );
+                }
+            }
             TOOL_INCREMENTAL_UPDATES_METRIC => {
                 let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
                     panic!("tool updates must be a counter");
@@ -193,6 +328,11 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
             _ => {}
         }
     }
+    // Six exposure samples per sampling request, excluding compaction.
+    assert_eq!(
+        registration_samples,
+        6 * if use_responses_lite { 5 } else { 4 }
+    );
     if use_responses_lite {
         let body = requests[2].body_json();
         let exec = body["input"]
@@ -236,13 +376,17 @@ async fn incremental_tools_append_changed_catalog_without_rewriting_history(
         );
     }
     insta::assert_snapshot!(
-        if use_responses_lite {
+        if suppress_model_change_announcements == Some(true) {
+            "incremental_tools_suppressed_announcements"
+        } else if use_responses_lite {
             "incremental_tools"
         } else {
             "incremental_tools_responses_api"
         },
         context_snapshot::format_request_history_snapshot(
-            if use_responses_lite {
+            if suppress_model_change_announcements == Some(true) {
+                "A model switch suppresses the model ID announcement while appending changed tools and replacement instructions. Repeated turns preserve the prefix; compaction starts a new window with the updated base."
+            } else if use_responses_lite {
                 "Tool definitions precede the initial base instructions. A model switch appends one developer notice, changed tools, and replacement instructions without rewriting the prefix; compaction starts a new window with the updated base."
             } else {
                 "Regular Responses requests carry the full current tool catalog without an incremental notice; changed execution instructions replace the catalog on subsequent requests."

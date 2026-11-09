@@ -247,11 +247,20 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
         });
         let updates = fragment
             .into_iter()
+            .filter(|fragment| !self.0.is_window_prefix() || fragment.role() == "developer")
             .map(|fragment| {
-                WorldStateUpdate::fragment(WorldStateContextFragment {
+                let update = WorldStateUpdate::fragment(WorldStateContextFragment {
                     fragment,
                     content_kind: ContentItemKind(format!("{}.instructions", self.0.id())),
-                })
+                });
+                if self.0.is_window_prefix() {
+                    WorldStateUpdate {
+                        placement: Placement::Prefix,
+                        ..update
+                    }
+                } else {
+                    update
+                }
             })
             .collect();
         (snapshot, updates)
@@ -280,8 +289,8 @@ impl ContextualUserFragment for WorldStateContextFragment {
         self.fragment.markers()
     }
 
-    fn body(&self) -> String {
-        self.fragment.body().to_string()
+    fn body(&self) -> ContentItem {
+        self.fragment.body().clone()
     }
 
     fn type_markers() -> (&'static str, &'static str) {
@@ -363,9 +372,21 @@ impl WorldStateHash {
 
     pub(crate) fn from_fragment(fragment: &(impl ContextualUserFragment + ?Sized)) -> Self {
         let mut hasher = Sha1::new();
-        hasher.update(b"codex-world-state-fragment-v1\0");
-        hash_component(&mut hasher, fragment.role());
-        hash_component(&mut hasher, &fragment.render());
+        match fragment.render() {
+            ContentItem::InputText { text } => {
+                hasher.update(b"codex-world-state-fragment-v1\0");
+                hash_component(&mut hasher, fragment.role());
+                hash_component(&mut hasher, &text);
+            }
+            content => {
+                let content = serde_json::to_vec(&content)
+                    .unwrap_or_else(|_| unreachable!("ContentItem always serializes"));
+                hasher.update(b"codex-world-state-fragment-v2\0");
+                hash_component(&mut hasher, fragment.role());
+                hasher.update((content.len() as u64).to_be_bytes());
+                hasher.update(content);
+            }
+        }
         Self(format!("{:x}", hasher.finalize()))
     }
 }

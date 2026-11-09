@@ -19,12 +19,8 @@ use ts_rs::TS;
 /// Result of stopping an unfinished root turn so another worker can recover it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SuspendTurnOutcome {
-    Suspended {
-        turn_id: String,
-    },
+    Suspended { turn_id: String },
     NotActive,
-    /// A currently loaded descendant would remain running after root handoff.
-    HasLiveDescendants,
     UnsupportedTask,
 }
 
@@ -63,6 +59,9 @@ pub struct ResponseItemAnnotations {
 #[derive(Clone, Debug)]
 pub struct TurnInputRequest {
     pub input: TurnInput,
+    /// Optional host-assigned UUID for the Responses message created from [`TurnInput::UserInput`].
+    /// Ignored for all other inputs, including raw user-role Responses items.
+    pub user_item_uuid: Option<uuid::Uuid>,
     pub thread_settings: ThreadSettingsOverrides,
     pub start: TurnStartOptions,
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
@@ -120,6 +119,7 @@ impl TurnInputRequest {
     pub fn new(input: TurnInput) -> Self {
         Self {
             input,
+            user_item_uuid: None,
             thread_settings: ThreadSettingsOverrides::default(),
             start: TurnStartOptions::default(),
             additional_context: BTreeMap::new(),

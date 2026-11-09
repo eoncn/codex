@@ -72,7 +72,10 @@ impl Session {
         let model_info = settings.model_info.as_ref();
         let model_messages = ResolvedModelMessages::from_model(model_info);
         tracing::trace!(
-            selected_capability_root_count = step_context.selected_capability_roots.len(),
+            selected_capability_root_count = step_context
+                .extension_data
+                .get::<Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>>()
+                .map_or(0, |roots| roots.len()),
             "building step world state"
         );
         let render_current_instructions = || {
@@ -97,7 +100,14 @@ impl Session {
                 Some(BaseInstructionsProvenance::Model { .. }) => render_current_instructions(),
                 Some(BaseInstructionsProvenance::Custom) | None => base_instructions.text,
             };
-            ModelInstructionsState::for_incremental_tools(&model_info.slug, instructions)
+            ModelInstructionsState::for_incremental_tools(
+                &model_info.slug,
+                instructions,
+                turn_context
+                    .config
+                    .features
+                    .enabled(Feature::SuppressModelChangeAnnouncements),
+            )
         } else {
             let model_instructions = render_current_instructions();
             let base_instructions = self.get_prompt_base_instructions().await.text;
@@ -162,7 +172,9 @@ impl Session {
         let extension_metrics = super::extension_metrics::from_session_telemetry(
             step_context.session_telemetry.clone(),
         );
-        if incremental_tools {
+        let preserve_parent_tool_declarations =
+            !new_window && self.preserve_parent_tool_declarations();
+        if incremental_tools && !preserve_parent_tool_declarations {
             let specs = step_context.tool_router.model_visible_specs();
             let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
             world_state.add_section(TopLevelToolsState::new(
@@ -217,6 +229,8 @@ impl Session {
             .services
             .exec_policy
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
+        let approval_context =
+            ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages);
         if turn_context.config.include_permissions_instructions {
             let environment = step_context.environments.primary();
             let sandbox = environment
@@ -236,7 +250,7 @@ impl Session {
             world_state.add_section(PermissionsState::new(
                 &permission_profile,
                 settings.approval_policy(),
-                ApprovalPromptContext::new(settings.approvals_reviewer(), model_messages),
+                approval_context,
                 exec_policy.as_ref(),
                 &cwd,
                 paths.as_ref(),
@@ -250,7 +264,10 @@ impl Session {
                     .enabled(Feature::RequestPermissionsTool),
             ));
         } else {
-            world_state.add_section(CompactPermissionsState::new(exec_policy.as_ref()));
+            world_state.add_section(CompactPermissionsState::new(
+                exec_policy.as_ref(),
+                approval_context.approved_command_prefix_saved_heading(),
+            ));
         }
         if turn_context.config.include_collaboration_mode_instructions {
             world_state.add_section(CollaborationModeState::from_collaboration_mode(
@@ -339,26 +356,14 @@ impl Session {
             ));
         }
         let environments = step_context.environments.to_selections();
-        let ready_selected_capability_roots = step_context
-            .selected_capability_roots
-            .iter()
-            .map(|root| root.selected_root().clone())
-            .collect::<Vec<_>>();
         let previous_world_state = self.state.lock().await.history.world_state_checkpoint();
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
-                    executor_capability_discovery_v2: step_context
-                        .executor_capability_discovery_v2
-                        .as_deref(),
                     thread_id: self.thread_id(),
                     turn_id: turn_context.sub_id.as_str(),
                     model_info: &step_context.settings.model_info,
                     environments: &environments,
-                    ready_selected_capability_roots: &ready_selected_capability_roots,
-                    executor_capability_discovery: step_context
-                        .executor_capability_discovery
-                        .as_deref(),
                     extension_metrics: Some(Arc::clone(&extension_metrics)),
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
