@@ -59,6 +59,7 @@ pub(crate) struct ExhaustedResponseRetry {
 
 /// Returns `Ok(())` when the caller should retry the request loop, or the original error when
 /// it is terminal or the retry budget is exhausted.
+#[tracing::instrument(level = "trace", skip_all, fields(request = ?request))]
 pub(crate) async fn handle_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
@@ -89,8 +90,8 @@ pub(crate) async fn handle_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
-    // On server overload keep sampling and remote compaction active rather than
-    // consuming the configured retry budget or switching transports.
+    // Keep this sampling/foreground compaction turn active on overload (unattended development).
+    // Do not consume the ordinary stream retry budget or switch transports.
     if matches!(err.details(), CodexErrorDetails::ServerOverloaded)
         && capacity_retry_enabled()
     {
@@ -99,7 +100,7 @@ pub(crate) async fn handle_response_stream_error(
         let delay = capacity_retry_delay(attempt);
         let now = Instant::now();
         let local_deadline = now + delay;
-        // Respect both the local backoff and any server-supplied Retry-After.
+        // Never retry earlier than either the local backoff or server advice.
         let retry_at = err
             .retry_after()
             .map_or(local_deadline, |advice| local_deadline.max(advice.deadline()));
@@ -216,7 +217,7 @@ pub(crate) async fn handle_response_stream_error(
 }
 
 pub(crate) fn capacity_retry_enabled() -> bool {
-    // Enabled by default for unattended development. Set the variable to 0 to opt out.
+    // Enabled by default for unattended AI development; set CODEX_CAPACITY_RETRY_FOREVER=0 to disable.
     std::env::var("CODEX_CAPACITY_RETRY_FOREVER").map_or(true, |value| value != "0")
 }
 
@@ -227,7 +228,7 @@ fn capacity_retry_base_secs(attempt: u64) -> u64 {
 
 pub(crate) fn capacity_retry_delay(attempt: u64) -> Duration {
     let base_secs = capacity_retry_base_secs(attempt);
-    // Positive jitter of up to 10% reduces synchronized retry storms.
+    // Positive jitter (0-10%) avoids synchronized retry storms.
     let jitter_ms = rand::rng().random_range(0..=(base_secs * 100));
     Duration::from_secs(base_secs) + Duration::from_millis(jitter_ms)
 }

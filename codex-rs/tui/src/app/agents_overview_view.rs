@@ -1,5 +1,6 @@
 //! Dashboard for inspecting and managing the TUI's retained daemon tasks.
 //! Search, rename, status filters and selection survive metadata refreshes.
+//! The caller supplies rows in status, descending update time, and thread ID order.
 
 #[path = "agent_center/mod.rs"]
 pub(super) mod command_center;
@@ -7,7 +8,7 @@ pub(super) mod command_center;
 #[path = "agents_overview_grouping.rs"]
 mod grouping;
 
-pub(super) use codex_config::types::AgentsOverviewGrouping;
+pub(super) use grouping::AgentsOverviewGrouping;
 use grouping::model_name;
 
 use super::agents_overview::AGENTS_OVERVIEW_VIEW_ID;
@@ -35,6 +36,7 @@ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
+use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadStatus;
@@ -56,6 +58,7 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -72,8 +75,8 @@ pub(super) enum AgentsOverviewGroup {
 }
 
 impl AgentsOverviewGroup {
-    pub(super) fn for_status(status: &ThreadStatus) -> Self {
-        match status {
+    pub(super) fn for_thread(thread: &Thread) -> Self {
+        match &thread.status {
             ThreadStatus::Active { active_flags }
                 if active_flags.contains(&ThreadActiveFlag::WaitingOnApproval)
                     || active_flags.contains(&ThreadActiveFlag::WaitingOnUserInput) =>
@@ -82,8 +85,9 @@ impl AgentsOverviewGroup {
             }
             ThreadStatus::Active { .. } => Self::Working,
             ThreadStatus::Idle => Self::Ready,
-            ThreadStatus::SystemError => Self::NeedsYou,
-            ThreadStatus::NotLoaded => Self::Finished,
+            // A subagent failure ends its work without asking the user to act.
+            ThreadStatus::SystemError if !is_subagent(thread) => Self::NeedsYou,
+            ThreadStatus::SystemError | ThreadStatus::NotLoaded => Self::Finished,
         }
     }
 
@@ -97,6 +101,10 @@ impl AgentsOverviewGroup {
     }
 }
 
+fn is_subagent(thread: &Thread) -> bool {
+    thread.parent_thread_id.is_some() || matches!(thread.source, SessionSource::SubAgent(_))
+}
+
 #[derive(Clone)]
 pub(super) struct AgentsOverviewRow {
     pub(super) details: AgentsOverviewDetails,
@@ -104,6 +112,7 @@ pub(super) struct AgentsOverviewRow {
     pub(super) thread_id: ThreadId,
     pub(super) group: AgentsOverviewGroup,
     pub(super) is_current: bool,
+    pub(super) unread: bool,
     pub(super) has_voice: bool,
 }
 
@@ -139,6 +148,13 @@ impl AgentsOverviewProjectGroup {
     }
 }
 
+pub(super) fn directory_group_key(cwd: &Path, worktrees_enabled: bool) -> PathBuf {
+    worktrees_enabled
+        .then(|| dunce::canonicalize(cwd).ok())
+        .flatten()
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
 #[derive(Default)]
 pub(super) struct AgentsOverviewViewState {
     scroll: usize,
@@ -154,6 +170,8 @@ pub(super) struct AgentsOverviewViewState {
     pub(super) has_more: bool,
     show_more_selected: bool,
     pub(super) connection_notice: Option<&'static str>,
+    /// Browse only while the server holds its lifecycle lock.
+    pub(super) removal: Option<AgentsOverviewAction>,
     pub(super) server_version_notice: Option<String>,
     search: String,
     searching: bool,
@@ -183,6 +201,7 @@ pub(super) struct AgentsOverviewView {
     use_theme_colors: bool,
     pub(super) rows: Vec<AgentsOverviewRow>,
     project_groups: Vec<AgentsOverviewProjectGroup>,
+    directory_group_keys: Vec<PathBuf>,
     pub(super) pinned_thread_ranks: Option<HashMap<ThreadId, usize>>,
     pub(super) pin_action_pending: bool,
     selected: usize,
@@ -218,6 +237,10 @@ impl AgentsOverviewView {
         let project_groups = rows
             .iter()
             .map(|row| AgentsOverviewProjectGroup::for_thread(&row.thread, worktrees_enabled))
+            .collect();
+        let directory_group_keys = rows
+            .iter()
+            .map(|row| directory_group_key(row.thread.cwd.as_path(), worktrees_enabled))
             .collect();
         let center_shortcut_keys = crate::keymap::keymap_action_ids()
             .filter(|action| matches!(action.context, KeymapContext::List | KeymapContext::Agents))
@@ -255,6 +278,7 @@ impl AgentsOverviewView {
             use_theme_colors,
             rows,
             project_groups,
+            directory_group_keys,
             pinned_thread_ranks: None,
             pin_action_pending: false,
             selected,
@@ -391,7 +415,9 @@ impl AgentsOverviewView {
 
     fn status(row: &AgentsOverviewRow) -> (&'static str, Span<'static>) {
         match row.group {
-            AgentsOverviewGroup::NeedsYou if row.thread.status == ThreadStatus::SystemError => {
+            AgentsOverviewGroup::NeedsYou
+                if row.thread.status == ThreadStatus::SystemError && !is_subagent(&row.thread) =>
+            {
                 ("Error", "!".red())
             }
             AgentsOverviewGroup::NeedsYou => ("Needs input", "●".red()),
@@ -568,6 +594,9 @@ impl BottomPaneView for AgentsOverviewView {
             self.reconcile_command_center_selection();
             return CancellationEvent::Handled;
         }
+        if state.removal.is_some() {
+            return CancellationEvent::Handled;
+        }
         CancellationEvent::NotHandled
     }
 
@@ -627,7 +656,9 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
 
-        if (self.state().connection_notice.is_some() || self.state().creating_worktree)
+        if (self.state().connection_notice.is_some()
+            || self.state().creating_worktree
+            || self.state().removal.is_some())
             && self.keymap.action_for(key) != Some(ListAction::Cancel)
         {
             match self.keymap.action_for(key) {
@@ -635,6 +666,12 @@ impl BottomPaneView for AgentsOverviewView {
                 Some(ListAction::MoveDown) => self.move_selection(/*forward*/ true),
                 Some(action @ (ListAction::PageUp | ListAction::PageDown)) => {
                     self.page_selection(action)
+                }
+                Some(ListAction::JumpTop) => {
+                    self.selected = self.visible_indices().first().copied().unwrap_or(0);
+                }
+                Some(ListAction::JumpBottom) => {
+                    self.selected = self.visible_indices().last().copied().unwrap_or(0);
                 }
                 _ => {}
             }
@@ -648,12 +685,15 @@ impl BottomPaneView for AgentsOverviewView {
         if self.agents_keymap.toggle_grouping.is_pressed(key) {
             let mut state = self.state();
             state.grouping = match state.grouping {
-                AgentsOverviewGrouping::Project => AgentsOverviewGrouping::Status,
+                AgentsOverviewGrouping::Project => AgentsOverviewGrouping::Directory,
+                AgentsOverviewGrouping::Directory => AgentsOverviewGrouping::Status,
                 AgentsOverviewGrouping::Status => AgentsOverviewGrouping::Model,
                 AgentsOverviewGrouping::Model => AgentsOverviewGrouping::Project,
             };
-            self.app_event_tx
-                .send(AppEvent::PersistAgentsOverviewGrouping(state.grouping));
+            if let Some(grouping) = state.grouping.persisted() {
+                self.app_event_tx
+                    .send(AppEvent::PersistAgentsOverviewGrouping(grouping));
+            }
             return;
         }
         if self.agents_keymap.toggle_pin.is_pressed(key) {

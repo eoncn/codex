@@ -52,6 +52,7 @@ use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::hooks_rpc::HookTrustUpdate;
+use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::KeyChordMatcher;
 use crate::keymap::RuntimeKeymap;
@@ -129,7 +130,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillErrorInfo;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
@@ -214,8 +215,12 @@ mod app_server_events;
 pub(crate) mod app_server_requests;
 mod app_server_thread_ownership;
 mod backend_banner_fallback;
+mod backend_events;
+mod backend_selection;
+pub(crate) mod backend_sessions;
 mod background_requests;
 mod composer_hints;
+mod config_panel;
 mod config_persistence;
 mod connector_mentions;
 mod daemon_menu;
@@ -235,9 +240,11 @@ mod managed_worktree_creation;
 mod misalignment_policy;
 mod model_defaults;
 mod new_session;
+mod quick_dials;
 mod turn_tips;
 pub(crate) use new_session::has_launch_setting;
 mod clipboard;
+mod footer_selection;
 mod native_history;
 mod owned_transcript;
 mod pending_interactive_replay;
@@ -254,8 +261,11 @@ mod reconnect;
 mod replay_filter;
 mod resize_reflow;
 mod resume_config;
+mod resume_preparation;
 mod right_click_paste;
+pub(crate) use right_click_paste::PasteEnvironment;
 mod safety_buffering;
+mod safety_recourse;
 mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
@@ -273,6 +283,7 @@ mod thread_settings;
 mod thread_title;
 mod transcript_export;
 mod tui_mode_picker;
+mod user_turn_submission;
 mod user_verification;
 mod user_verification_errors;
 mod user_verification_requests;
@@ -314,15 +325,15 @@ enum ThreadInteractiveRequest {
 /// receiver thread ids. All other notification variants return `None`.
 fn collab_receiver_thread_ids(notification: &ServerNotification) -> Option<&[String]> {
     match notification {
-        ServerNotification::ItemStarted(notification) => match &notification.item {
-            ThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemStarted(notification) => match &notification.item.payload {
+            ThreadItemPayload::CollabAgentToolCall {
                 receiver_thread_ids,
                 ..
             } => Some(receiver_thread_ids),
             _ => None,
         },
-        ServerNotification::ItemCompleted(notification) => match &notification.item {
-            ThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemCompleted(notification) => match &notification.item.payload {
+            ThreadItemPayload::CollabAgentToolCall {
                 receiver_thread_ids,
                 ..
             } => Some(receiver_thread_ids),
@@ -332,14 +343,14 @@ fn collab_receiver_thread_ids(notification: &ServerNotification) -> Option<&[Str
     }
 }
 
-fn sub_agent_activity_item(notification: &ServerNotification) -> Option<&ThreadItem> {
+fn sub_agent_activity_item(notification: &ServerNotification) -> Option<&ThreadItemPayload> {
     match notification {
-        ServerNotification::ItemStarted(notification) => match &notification.item {
-            ThreadItem::SubAgentActivity { .. } => Some(&notification.item),
+        ServerNotification::ItemStarted(notification) => match &notification.item.payload {
+            ThreadItemPayload::SubAgentActivity { .. } => Some(&notification.item.payload),
             _ => None,
         },
-        ServerNotification::ItemCompleted(notification) => match &notification.item {
-            ThreadItem::SubAgentActivity { .. } => Some(&notification.item),
+        ServerNotification::ItemCompleted(notification) => match &notification.item.payload {
+            ThreadItemPayload::SubAgentActivity { .. } => Some(&notification.item.payload),
             _ => None,
         },
         _ => None,
@@ -351,8 +362,8 @@ fn collab_receiver_is_not_found(
     receiver_thread_id: &str,
 ) -> bool {
     match notification {
-        ServerNotification::ItemCompleted(notification) => match &notification.item {
-            ThreadItem::CollabAgentToolCall { agents_states, .. } => {
+        ServerNotification::ItemCompleted(notification) => match &notification.item.payload {
+            ThreadItemPayload::CollabAgentToolCall { agents_states, .. } => {
                 agents_states.get(receiver_thread_id).is_some_and(|state| {
                     matches!(
                         &state.status,
@@ -486,10 +497,7 @@ pub(crate) enum AppRunControl {
 #[derive(Debug, Clone)]
 pub enum ExitReason {
     UserRequested,
-    Archived(ThreadId),
     TurnInterrupted,
-    /// The current thread was deleted, rather than disconnected.
-    ThreadRemoved,
     Fatal(String),
 }
 
@@ -528,8 +536,11 @@ struct InitialHistoryReplayBuffer {
 
 pub(crate) struct App {
     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
+    config_notification_test_generation: u64,
+    config_notification_test_pending: Option<u64>,
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
+    terminal_size_tags: crate::terminal_size_telemetry::LaunchTags,
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) chat_widget: ChatWidget,
     workspace_command_runner: Option<WorkspaceCommandRunner>,
@@ -539,6 +550,10 @@ pub(crate) struct App {
     launch_cwd: PathBuf,
     /// Resume anchor selected by `/cd`; ordinary resumes retain the immutable launch cwd.
     runtime_working_directory_override: Option<PathBuf>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "retain the state runtime for the app lifetime")
+    )]
     pub(crate) state_db: Option<StateDbHandle>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
@@ -556,6 +571,7 @@ pub(crate) struct App {
     native_history: native_history::NativeHistory,
     turn_tips: turn_tips::TurnTips,
     pub(crate) transcript_view: crate::transcript_view::TranscriptView,
+    conversation_frame: owned_transcript::ConversationFrame,
     last_rendered_history_tail: Option<history_ui::RenderedHistoryTail>,
     last_thread_usage_status_cell: Option<history_ui::ThreadUsageStatusHistory>,
     pub(crate) pending_thread_usage_history_refresh: bool,
@@ -573,6 +589,7 @@ pub(crate) struct App {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) keymap: RuntimeKeymap,
     pub(crate) key_chord_matcher: KeyChordMatcher,
+    routed_key_activation: Option<KeyBinding>,
 
     /// The foreground loop owns stream pacing; stopped animations have no timer.
     pub(crate) commit_animation: Option<tokio::time::Interval>,
@@ -599,6 +616,8 @@ pub(crate) struct App {
     /// Set when the user confirms an update; propagated on exit.
     daemon_cli_executable: Option<AbsolutePathBuf>,
     pub(crate) pending_update_action: Option<UpdateAction>,
+    /// Retained through all loop exits so shutdown cannot interrupt stop followed by start.
+    daemon_restart: Option<JoinHandle<anyhow::Result<codex_app_server_daemon::LifecycleOutput>>>,
 
     /// Tracks the thread we intentionally shut down while exiting the app.
     ///
@@ -613,7 +632,7 @@ pub(crate) struct App {
     windows_sandbox: WindowsSandboxState,
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
-    pending_realtime_speech_replay: HashMap<ThreadId, Vec<(String, ThreadItem)>>,
+    pending_realtime_speech_replay: HashMap<ThreadId, Vec<(String, ThreadItemPayload)>>,
     pending_realtime_transcript_replay:
         HashMap<ThreadId, VecDeque<crate::chatwidget::RealtimeTranscriptRecord>>,
     realtime_replay_order: VecDeque<ThreadId>,
@@ -654,7 +673,8 @@ pub(crate) struct App {
     pending_managed_worktree_attach: Option<Box<working_directory::ManagedWorktreeAttach>>,
     /// Keeps protected screens quarantined until initialized chat receives genuine user input.
     startup_protected_input_boundary: bool,
-    /// Keeps that boundary armed while a startup approval waits for the typing-idle timer.
+    /// Keeps that boundary armed while an approval waits for the typing-idle timer or a visible
+    /// modal's terminal input has not settled.
     startup_pending_protected_request: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
     account_email_request_id: Option<uuid::Uuid>,
@@ -849,12 +869,51 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        self.transcript_view
+            .sync_patch_approval(self.chat_widget.current_patch_approval());
         tui.link_hover.observe(&event);
         self.refresh_link_hover(tui)?;
         self.invalidate_right_click_paste(&event);
         self.finish_clipboard(tui, &event);
         let event = self.finish_right_click_paste(tui, event);
+        if self.startup_protected_input_boundary
+            && self.startup_pending_protected_request
+            && self.chat_widget.has_active_modal()
+            && matches!(
+                &event,
+                TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::Mouse(_)
+            )
+        {
+            self.discard_startup_modal_input(tui)?;
+            return Ok(AppRunControl::Continue);
+        }
+        if matches!(&event, TuiEvent::Key(key) if key.kind != KeyEventKind::Release)
+            || matches!(&event, TuiEvent::Paste(text) if !text.is_empty())
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+        {
+            self.chat_widget.acknowledge_program_status();
+        }
         let idle_draw = matches!(event, TuiEvent::Draw);
+        if let TuiEvent::Key(key) = &event {
+            self.backtrack.observe_pending_select_exit_key(*key);
+        }
+        if let TuiEvent::Key(key) = &event
+            && let Some(binding) = self.backtrack.select_exit_key
+        {
+            if binding.parts() == crate::key_hint::KeyBinding::from_event(*key).parts() {
+                if key.kind == KeyEventKind::Release
+                    || !self.enhanced_keys_supported
+                    || !crate::tui::reports_key_releases()
+                {
+                    self.backtrack.select_exit_key = None;
+                }
+                return Ok(AppRunControl::Continue);
+            }
+            self.backtrack.select_exit_key = None;
+        }
+        if self.handle_rendered_selection_event(tui, &event)? {
+            return Ok(AppRunControl::Continue);
+        }
         if matches!(&event, TuiEvent::Key(_))
             && self.handle_composer_copy_event(tui, &event, |tui, text| {
                 tui.copy_transcript_selection(text, crate::clipboard_copy::CopyFormat::PlainText)
@@ -883,6 +942,9 @@ impl App {
         if self.reconnect.offline
             && !transcript_owns_input
             && !self.chat_widget.keymap_contexts().is_warnings()
+            && !self
+                .chat_widget
+                .active_view_accepts_input_when_disconnected()
             && let TuiEvent::Key(key) = &event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -903,8 +965,15 @@ impl App {
             self.handle_draw_pre_render(tui, screen_size)?;
         }
 
-        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost) {
+        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost)
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+        {
             self.cancel_pending_key_chord();
+        }
+        if matches!(&event, TuiEvent::FocusLost)
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+        {
+            self.chat_widget.interrupt_config_editor_transition();
         }
 
         if self.overlay.is_none()
@@ -948,9 +1017,12 @@ impl App {
                     })
                 && app.keymap.chat.toggle_voice.is_pressed(key)
         };
-        // Find consumes otherwise-unhandled keys; let enabled voice controls reach App.
+        // Transcript interactions consume otherwise-unhandled keys; let enabled voice controls
+        // reach App.
         if !matches!(&event, TuiEvent::Key(key)
-            if voice_toggle(self, *key) && !self.transcript_view.owns_interaction_key(*key))
+            if voice_toggle(self, *key)
+                && (!self.transcript_view.owns_interaction_key(*key)
+                    || self.transcript_view.is_select_mode()))
             && self.handle_owned_transcript_event(tui, app_server, &event)?
         {
             return Ok(AppRunControl::Continue);
@@ -1014,16 +1086,29 @@ impl App {
                         && self.chat_widget.agents_navigation_key_available()))
             {
                 self.open_agents_overview(app_server);
-            } else if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview {
-                self.chat_widget.handle_disconnected_view_key(*key);
-                if self
-                    .chat_widget
-                    .selected_index_for_present_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
-                    .is_none()
+            } else if self
+                .chat_widget
+                .active_view_accepts_input_when_disconnected()
+                || (self.reconnect.presentation == reconnect::ReconnectPresentation::Overview
+                    && self
+                        .chat_widget
+                        .active_view_is(agents_overview::AGENTS_OVERVIEW_VIEW_ID))
+            {
+                let activation_key = self.routed_key_activation.take();
+                self.chat_widget
+                    .handle_disconnected_view_key(*key, activation_key);
+                if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview
+                    && self
+                        .chat_widget
+                        .selected_index_for_present_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
+                        .is_none()
                 {
                     self.reconnect.presentation = reconnect::ReconnectPresentation::Conversation;
                 }
             } else {
+                if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview {
+                    self.reconnect.presentation = reconnect::ReconnectPresentation::Conversation;
+                }
                 self.chat_widget
                     .handle_restricted_key(*key, RestrictedInputMode::Disconnected);
             }
@@ -1032,6 +1117,7 @@ impl App {
 
         match &event {
             TuiEvent::FocusLost => {
+                app_server.focused_conversation = None;
                 self.chat_widget
                     .set_sparkle_terminal_focus(/*focused*/ false);
                 let now = Instant::now();
@@ -1049,6 +1135,10 @@ impl App {
             _ => {}
         }
 
+        let draws_history = matches!(
+            event,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained
+        );
         if self.overlay.is_some() {
             let _ = self
                 .handle_backtrack_overlay_event(tui, app_server, event)
@@ -1072,12 +1162,15 @@ impl App {
                             self.reset_backtrack_state();
                         }
                     }
-                    self.chat_widget.handle_paste(pasted);
-                    if self.reconnect.offline
+                    let restrict_disconnected_input = self.reconnect.offline
                         && !self.chat_widget.keymap_contexts().is_warnings()
                         && self.reconnect.presentation
-                            == reconnect::ReconnectPresentation::Conversation
-                    {
+                            != reconnect::ReconnectPresentation::Overview
+                        && !self
+                            .chat_widget
+                            .active_view_accepts_input_when_disconnected();
+                    self.chat_widget.handle_paste(pasted);
+                    if restrict_disconnected_input {
                         self.chat_widget.handle_restricted_key(
                             KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
                             RestrictedInputMode::Disconnected,
@@ -1115,16 +1208,10 @@ impl App {
                         && self.chat_widget.has_active_modal()
                         && self.startup_protected_input_boundary
                     {
-                        tui.discard_pending_input_before_interactive_screen()?;
-                        self.startup_pending_protected_request = false;
+                        self.discard_startup_modal_input(tui)?;
                     }
                     if self.chat_widget.ambient_pet_image_enabled() {
-                        let ambient_pet_area = Rect::new(
-                            /*x*/ 0,
-                            /*y*/ 0,
-                            screen_size.width,
-                            screen_size.height,
-                        );
+                        let ambient_pet_area = self.conversation_area(screen_size.into());
                         if let Err(err) = tui.draw_ambient_pet_image(
                             self.chat_widget
                                 .ambient_pet_draw(ambient_pet_area, rendered_area.bottom()),
@@ -1151,6 +1238,46 @@ impl App {
                 TuiEvent::FocusLost => {}
             }
         }
+        if draws_history {
+            let frozen = self.chat_widget.is_external_writer_view();
+            let visible = self.current_displayed_thread_id().filter(|&id| {
+                tui.is_terminal_focused()
+                    && matches!(self.overlay, None | Some(Overlay::Transcript(_)))
+                    && self.chat_widget.no_modal_or_popup_active()
+                    && self.initial_history_replay_buffer.is_none()
+                    && (!self.thread_unavailable(id) || frozen)
+            });
+            let previous = std::mem::replace(&mut app_server.focused_conversation, visible);
+            if previous != visible {
+                app_server.attempted_revision = None;
+            }
+            // Opening a full view counts immediately. Within the same view a new result's
+            // receipt can arrive just before the terminal event that finishes rendering it.
+            if let Some(id) = visible
+                && (previous != visible || !self.chat_widget.is_agent_turn_running())
+                && let Some(revision) = app_server.viewed_revision(id, frozen)
+            {
+                // A read-only snapshot does not subscribe to receipt notifications.
+                let refresh = frozen.then(|| {
+                    (
+                        self.app_event_tx.clone(),
+                        AppEvent::RefreshViewedThread {
+                            backend_id: app_server.backend_id(),
+                            thread_id: id,
+                            revision: revision.clone(),
+                        },
+                    )
+                });
+                let update = app_server.acknowledge_read(id, revision);
+                tokio::spawn(async move {
+                    if let Err(error) = update.await {
+                        tracing::warn!(%id, %error, "Could not acknowledge viewed conversation");
+                    } else if let Some((tx, event)) = refresh {
+                        tx.send(event);
+                    }
+                });
+            }
+        }
         // Both transcript owners must consume completions before automatic work advances.
         if idle_draw {
             tui.clipboard.advance(tui.frame_requester());
@@ -1168,13 +1295,22 @@ impl App {
         Ok(())
     }
 
+    fn prepare_frame_images(&mut self) -> Option<crate::pets::ImageProtocol> {
+        let protocol = self.chat_widget.pet_image_support().protocol().filter(|_| {
+            !self.app_server_target.uses_remote_workspace()
+                && crate::projectless::has_only_local_environments(&self.environment_manager)
+        });
+        self.chat_widget.prepare_composer_images(protocol);
+        protocol
+    }
+
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
-        self.sync_thread_title_progress();
         self.chat_widget
             .set_sparkle_terminal_focus(tui.is_terminal_focused());
         if tui.is_owned_screen() {
             return self.render_owned_transcript(tui, screen_size);
         }
+        self.prepare_frame_images();
         self.chat_widget
             .empty_state_animation
             .borrow_mut()
@@ -1209,6 +1345,9 @@ impl App {
                 let area = frame.area();
                 rendered_area = area;
                 chat_widget.render(area, frame.buffer);
+                if let Some(previews) = &self.chat_widget.composer_images {
+                    frame.image_placements = previews.placements.take();
+                }
                 self.chat_widget.note_rendered_width(area.width);
                 if let Some((x, y)) = chat_widget.cursor_pos(area) {
                     frame.set_cursor_style(chat_widget.cursor_style(area));

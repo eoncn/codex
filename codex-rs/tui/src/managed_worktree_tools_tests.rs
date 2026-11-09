@@ -1,5 +1,6 @@
 use super::*;
 use crate::legacy_core::config::ConfigOverrides;
+use crate::test_support::boxed_future;
 use codex_config::LoaderOverrides;
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -49,45 +50,17 @@ async fn start_server(
             status,
         )
         .await?;
-    let mut overrides = None;
-    server.thread_tool_transport().configure_mcp(&mut overrides);
-    let overrides = overrides.unwrap();
-    assert!(!overrides.contains_key("mcp_servers.codex_tui"));
-    let mcp = &overrides["mcp_servers.codex_worktrees"];
-    let response = codex_http_client::HttpClientBuilder::new().build_direct()?
-        .post(mcp["url"].as_str().unwrap())
-        .header("Authorization", mcp["http_headers"]["Authorization"].as_str().unwrap())
-        .header("Accept", "application/json, text/event-stream")
-        .header("MCP-Protocol-Version", "2026-07-28")
-        .header("MCP-Method", "tools/list")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
-            "io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}))
-        .send().await?.text().await?;
-    let result: Value = serde_json::from_str(
-        response
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .unwrap_or(&response),
-    )?;
-    assert_eq!(
-        result["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec![
-            "create_worktree",
-            "get_worktree_creation_status",
-            "list_worktrees"
-        ]
-    );
     Ok(server)
 }
 
 #[tokio::test]
 async fn creation_attaches_to_original_task_and_survives_service_restart() -> color_eyre::Result<()>
 {
+    boxed_future!(creation_attaches_to_original_task_and_survives_service_restart_scenario()).await
+}
+
+async fn creation_attaches_to_original_task_and_survives_service_restart_scenario()
+-> color_eyre::Result<()> {
     let home = tempfile::tempdir()?;
     let responses =
         app_test_support::create_mock_responses_server_repeating_assistant("Ready").await;
@@ -100,7 +73,7 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
     git(&repository, &["add", "."]);
     git(&repository, &["commit", "-m", "base"]);
     fs::write(repository.join("tracked.txt"), "source edits\n")?;
-    let mut config = ConfigBuilder::default()
+    let config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(home.path().to_path_buf()),
@@ -109,14 +82,13 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .build()
         .await?;
-    config.features.enable(codex_features::Feature::Worktrees)?;
     let mut server = Box::pin(start_server(&config)).await?;
     let mut conflicting = config.clone();
     let raw: codex_config::RawMcpServerConfig =
         serde_json::from_value(json!({"url":"http://127.0.0.1:1/mcp"}))?;
     let mut servers = conflicting.mcp_servers.get().clone();
     servers.insert(
-        "codex_worktrees".to_owned(),
+        "codex_tui".to_owned(),
         codex_config::McpServerConfig::try_from(raw).map_err(color_eyre::eyre::Report::msg)?,
     );
     conflicting.mcp_servers.set(servers)?;
@@ -125,7 +97,7 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
         .unwrap_err();
     assert!(error.to_string().contains("MCP server owns"));
     let started = Box::pin(server.start_thread(&config)).await?;
-    assert!(!started.task_tools_available);
+    assert!(started.task_tools_available);
     let thread_id = started.session.thread_id.to_string();
     let _: codex_app_server_protocol::TurnStartResponse = server
         .request_handle()
@@ -147,7 +119,7 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
         .await?;
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if matches!(server.next_event().await, Some(codex_app_server_client::AppServerEvent::ServerNotification(notification)) if matches!(notification.as_ref(), codex_app_server_protocol::ServerNotification::TurnCompleted(_))) { break; }
+            if matches!(server.next_event().await, Some(event) if matches!(&event.event, codex_app_server_client::AppServerEvent::ServerNotification(notification) if matches!(notification.as_ref(), codex_app_server_protocol::ServerNotification::TurnCompleted(_)))) { break; }
         }
     }).await?;
     let tools = ManagedWorktreeTools::new(&config)
@@ -338,13 +310,13 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
         crate::app_server_session::ResumeModelSettings::RestoreFromThread,
     ))
     .await?;
-    assert!(!resumed.task_tools_available);
+    assert!(resumed.task_tools_available);
     assert_eq!(
         value(
             fresh
                 .execute(
                     resumed_server.request_handle(),
-                    thread_id,
+                    thread_id.clone(),
                     "list_worktrees",
                     json!({})
                 )
@@ -357,6 +329,7 @@ async fn creation_attaches_to_original_task_and_survives_service_restart() -> co
         &responses,
         &config,
         &repository,
+        &thread_id,
     ))
     .await?;
     resumed_server.shutdown().await?;

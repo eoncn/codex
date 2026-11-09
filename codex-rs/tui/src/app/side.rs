@@ -2,8 +2,8 @@
 //!
 //! A side conversation is an ephemeral fork used for a quick /side question while keeping the
 //! primary thread focused. This module owns the app-level lifecycle for those forks: switching into
-//! them, returning to their parent, and discarding them when normal thread navigation moves
-//! elsewhere. The fork receives hidden developer instructions that make inherited history reference
+//! them, returning to their parent, retaining them across normal navigation, and explicitly
+//! discarding them. The fork receives hidden developer instructions that make inherited history
 //! material only and steer the agent away from mutations unless the side conversation explicitly asks
 //! for them.
 
@@ -227,6 +227,15 @@ impl SideThreadState {
 }
 
 impl App {
+    pub(super) async fn running_side_thread_id(&self) -> Option<ThreadId> {
+        for thread_id in self.side_threads.keys().copied() {
+            if self.active_turn_id_for_thread(thread_id).await.is_some() {
+                return Some(thread_id);
+            }
+        }
+        None
+    }
+
     pub(super) fn sync_side_thread_ui(&mut self) {
         let clear_side_ui = |chat_widget: &mut crate::chatwidget::ChatWidget| {
             chat_widget.set_side_conversation_context_label(/*label*/ None);
@@ -297,6 +306,12 @@ impl App {
         self.current_displayed_thread_id()
             .and_then(|thread_id| self.side_threads.get(&thread_id))
             .map(|state| state.parent_thread_id)
+    }
+
+    pub(super) fn side_thread_for_parent(&self, parent_thread_id: ThreadId) -> Option<ThreadId> {
+        self.side_threads.iter().find_map(|(thread_id, state)| {
+            (state.parent_thread_id == parent_thread_id).then_some(*thread_id)
+        })
     }
 
     pub(super) fn set_side_parent_status(
@@ -386,13 +401,8 @@ impl App {
         target_thread_id: ThreadId,
     ) -> Option<ThreadId> {
         let active_thread_id = self.current_displayed_thread_id()?;
-        let (&side_thread_id, state) = self.side_threads.iter().next()?;
-        if target_thread_id == side_thread_id || target_thread_id == active_thread_id {
-            return None;
-        }
-
-        (active_thread_id == side_thread_id || active_thread_id == state.parent_thread_id)
-            .then_some(side_thread_id)
+        let state = self.side_threads.get(&active_thread_id)?;
+        (target_thread_id == state.parent_thread_id).then_some(active_thread_id)
     }
 
     pub(super) async fn toggle_side_conversation(
@@ -403,12 +413,9 @@ impl App {
         let Some(active_thread_id) = self.current_displayed_thread_id() else {
             return Ok(());
         };
-        let Some((&side_thread_id, state)) = self.side_threads.iter().next() else {
-            return Ok(());
-        };
-        let target_thread_id = if active_thread_id == side_thread_id {
+        let target_thread_id = if let Some(state) = self.side_threads.get(&active_thread_id) {
             state.parent_thread_id
-        } else if active_thread_id == state.parent_thread_id {
+        } else if let Some(side_thread_id) = self.side_thread_for_parent(active_thread_id) {
             side_thread_id
         } else {
             return Ok(());
@@ -616,6 +623,8 @@ impl App {
 
     pub(super) fn side_boundary_prompt_item() -> ResponseItem {
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -725,12 +734,18 @@ impl App {
             return Ok(AppRunControl::Continue);
         }
 
-        if let Some((&side_thread_id, state)) = self.side_threads.iter().next()
-            && (parent_thread_id != state.parent_thread_id
-                || !self.discard_side_thread(app_server, side_thread_id).await)
-        {
-            self.restore_side_user_message(user_message.take());
-            self.sync_side_thread_ui();
+        if let Some(side_thread_id) = self.side_thread_for_parent(parent_thread_id) {
+            self.select_agent_thread(tui, app_server, side_thread_id)
+                .await?;
+            if self.active_thread_id == Some(side_thread_id) {
+                if let Some(user_message) = user_message.take() {
+                    let _ = self
+                        .chat_widget
+                        .submit_user_message_as_plain_user_turn(user_message);
+                }
+            } else {
+                self.restore_side_user_message(user_message.take());
+            }
             return Ok(AppRunControl::Continue);
         }
 
@@ -770,6 +785,7 @@ impl App {
                     /*agent_role*/ None,
                     /*is_closed*/ false,
                 );
+                self.sync_agent_picker_thread(child_thread_id);
                 if let Err(err) = app_server
                     .thread_inject_items(child_thread_id, vec![Self::side_boundary_prompt_item()])
                     .await
@@ -783,7 +799,7 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 if let Err(err) = self
-                    .select_agent_thread_and_discard_side(tui, app_server, child_thread_id)
+                    .select_agent_thread(tui, app_server, child_thread_id)
                     .await
                 {
                     let discarded = self
