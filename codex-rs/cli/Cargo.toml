@@ -92,6 +92,8 @@ owo-colors = { workspace = true }
 regex-lite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+semver = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 supports-color = { workspace = true }
 sys-locale = { workspace = true }
@@ -116,7 +118,13 @@ which = { workspace = true }
 [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = { workspace = true }
+tar = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies] 
+zip = { workspace = true }
+
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

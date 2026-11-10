@@ -30,6 +30,15 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     let action = update_action::get_update_action();
+    let current_version = if matches!(action, Some(UpdateAction::ForkRelease)) {
+        format!(
+            "{}.{}",
+            CODEX_CLI_VERSION,
+            option_env!("CODEX_FORK_BUILD_NUMBER").unwrap_or("0")
+        )
+    } else {
+        CODEX_CLI_VERSION.to_string()
+    };
     let version_file = version_filepath(config);
     let info = read_version_info(&version_file).ok();
 
@@ -49,7 +58,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        if is_newer(&info.latest_version, &current_version).unwrap_or(false) {
             Some(info.latest_version)
         } else {
             None
@@ -60,6 +69,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const FORK_RELEASE_URL: &str = "https://api.github.com/repos/eoncn/codex/releases/latest";
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {
@@ -83,6 +93,27 @@ async fn check_for_update(
     .with_legacy_custom_ca_fallback();
     let latest_version = match action {
         Some(UpdateAction::Daemon(_)) => return Ok(()),
+        Some(UpdateAction::ForkRelease) => {
+            let ReleaseInfo { tag_name } = client_pool
+                .get(FORK_RELEASE_URL)
+                .headers(default_headers())
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ReleaseInfo>()
+                .await?;
+            let version = tag_name
+                .strip_prefix("fork-v")
+                .ok_or_else(|| anyhow::anyhow!("Unexpected fork release tag: {tag_name}"))?;
+            let components: Vec<&str> = version.split('.').collect();
+            anyhow::ensure!(
+                components.len() == 4
+                    && components.iter().all(|part| !part.is_empty()
+                        && part.chars().all(|c| c.is_ascii_digit())),
+                "Invalid fork release version: {version}"
+            );
+            version.to_string()
+        }
         Some(UpdateAction::BrewUpgrade) => {
             let HomebrewCaskInfo { version } = client_pool
                 .get(HOMEBREW_CASK_API_URL)

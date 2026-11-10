@@ -59,6 +59,8 @@ mod daemon_telemetry;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
+#[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
+mod fork_updater;
 #[cfg(test)]
 #[path = "exec_args_tests.rs"]
 mod exec_args_tests;
@@ -795,6 +797,16 @@ fn run_update_action(
     action: UpdateAction,
     cli_executable: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    if action == UpdateAction::ForkRelease {
+        #[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
+        {
+            return fork_updater::run();
+        }
+        #[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+        {
+            anyhow::bail!("Fork updates support only Windows x64 and Intel macOS");
+        }
+    }
     if let UpdateAction::Daemon(source) = action {
         let executable = cli_executable
             .ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Codex CLI"))?;

@@ -126,7 +126,15 @@ impl UpdatePromptScreen {
         Self {
             request_frame,
             latest_version,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: if update_action == UpdateAction::ForkRelease {
+                format!(
+                    "{}.{}",
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("CODEX_FORK_BUILD_NUMBER").unwrap_or("0")
+                )
+            } else {
+                env!("CARGO_PKG_VERSION").to_string()
+            },
             update_action,
             highlighted: UpdateSelection::UpdateNow,
             selection: None,
@@ -227,7 +235,13 @@ impl WidgetRef for &UpdatePromptScreen {
             /*flex*/ 1,
             Paragraph::new(Line::from(vec![
                 "Release notes: ".dim(),
-                RELEASE_NOTES_URL.dim().underlined(),
+                (if self.update_action == UpdateAction::ForkRelease {
+                    "https://github.com/eoncn/codex/releases/latest"
+                } else {
+                    RELEASE_NOTES_URL
+                })
+                .dim()
+                .underlined(),
             ]))
             .wrap(Wrap { trim: false })
             .inset(Insets::vh(/*v*/ 0, /*h*/ 2)),

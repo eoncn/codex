@@ -18,7 +18,15 @@ pub(crate) struct VersionInfo {
 const VERSION_FILENAME: &str = "version.json";
 
 pub(crate) fn version_filepath(config: &Config) -> PathBuf {
-    config.codex_home.join(VERSION_FILENAME).into_path_buf()
+    // Isolate fork update metadata from the official Codex version cache.
+    let filename = if cfg!(any(windows, all(target_os = "macos", target_arch = "x86_64")))
+        && option_env!("CODEX_FORK_BUILD_NUMBER").is_some()
+    {
+        "fork-version.json"
+    } else {
+        VERSION_FILENAME
+    };
+    config.codex_home.join(filename).into_path_buf()
 }
 
 pub(crate) fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {

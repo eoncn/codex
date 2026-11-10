@@ -16,7 +16,7 @@ pub(crate) fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::
 
 #[cfg(any(not(debug_assertions), test))]
 pub(crate) fn is_source_build_version(version: &str) -> bool {
-    parse_version(version) == Some((0, 0, 0))
+    parse_version(version) == Some((0, 0, 0, 0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,18 +44,31 @@ pub(crate) fn server_version_notice_kind(
 }
 
 #[cfg(any(not(debug_assertions), test))]
-fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+fn parse_version(v: &str) -> Option<(u64, u64, u64, u64)> {
     let mut iter = v.trim().split('.');
     let maj = iter.next()?.parse::<u64>().ok()?;
     let min = iter.next()?.parse::<u64>().ok()?;
     let pat = iter.next()?.parse::<u64>().ok()?;
-    Some((maj, min, pat))
+    let build = iter.next().unwrap_or("0").parse::<u64>().ok()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    Some((maj, min, pat, build))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn compares_fork_build_revisions_without_changing_official_versions() {
+        assert_eq!(is_newer("0.167.0.2", "0.167.0.1"), Some(true));
+        assert_eq!(is_newer("0.167.0.1", "0.167.0.2"), Some(false));
+        assert_eq!(is_newer("0.168.0", "0.167.0.999"), Some(true));
+        assert_eq!(is_newer("0.167.0", "0.167.0.1"), Some(false));
+        assert_eq!(is_newer("0.167.0.1.2", "0.167.0"), None);
+    }
 
     #[test]
     fn extracts_version_from_latest_tag() {

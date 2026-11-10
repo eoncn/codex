@@ -1,0 +1,89 @@
+name: Publish fork update release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag, e.g. fork-v0.167.0.1 (must match both package build numbers)"
+        required: true
+        type: string
+      windows_run_id:
+        description: "Successful Build Windows Codex Binary workflow run ID"
+        required: true
+        type: string
+      macos_run_id:
+        description: "Successful Build macOS Intel Codex Package workflow run ID"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Verify both packages and publish latest fork release
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test fork release metadata and validation
+        shell: bash
+        run: python3 -m unittest scripts.tests.test_fork_release -v
+
+      - name: Download both successful build artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_RUN_ID: ${{ inputs.windows_run_id }}
+          MACOS_RUN_ID: ${{ inputs.macos_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$WINDOWS_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name codex-windows-x64 --dir dist
+          gh run download "$MACOS_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name codex-macos-intel-x64 --dir dist
+          test -s dist/codex-windows-x64.zip
+          test -s dist/codex-macos-intel.tar.gz
+
+      - name: Validate package version, platform, build number and calculate SHA-256
+        shell: bash
+        env:
+          FORK_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/fork_release.py manifest \
+            --tag "$FORK_TAG" \
+            --windows dist/codex-windows-x64.zip \
+            --macos dist/codex-macos-intel.tar.gz \
+            --output dist/codex-update.json
+          cat dist/codex-update.json
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; will not overwrite a published update."
+            exit 1
+          fi
+          gh release create "$FORK_TAG" \
+            dist/codex-update.json \
+            dist/codex-windows-x64.zip \
+            dist/codex-macos-intel.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Codex fork $FORK_TAG" \
+            --notes "Self-contained Windows x64 and Intel macOS fork builds, verified with codex-update.json SHA-256 checksums." \
+            --latest

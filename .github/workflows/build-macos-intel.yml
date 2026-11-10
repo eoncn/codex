@@ -2,6 +2,12 @@ name: Build macOS Intel Codex Package
 
 on:
   workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Monotonically increasing fork build number (same on both platforms)"
+        required: true
+        default: "1"
+        type: string
 
 permissions:
   contents: read
@@ -10,6 +16,8 @@ jobs:
   build-macos-intel:
     name: Build Codex (macOS Intel x64)
     runs-on: macos-15-intel
+    env:
+      CODEX_FORK_BUILD_NUMBER: ${{ inputs.build_number }}
     timeout-minutes: 180
     steps:
       - name: Checkout repository
@@ -42,8 +50,18 @@ jobs:
             --target x86_64-apple-darwin \
             --cargo-profile release \
             --package-dir "$RUNNER_TEMP/codex-package" \
-            --archive-output "$RUNNER_TEMP/codex-macos-intel.tar.gz" \
             --force
+
+      - name: Stamp fork build number and archive complete package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/fork_release.py stamp \
+            --package-dir "$RUNNER_TEMP/codex-package" \
+            --build "$CODEX_FORK_BUILD_NUMBER"
+          tar -czf "$RUNNER_TEMP/codex-macos-intel.tar.gz" \
+            -C "$RUNNER_TEMP/codex-package" \
+            bin codex-resources codex-path codex-package.json
 
       - name: Verify packaged binary, manifest and archive
         shell: bash
@@ -64,6 +82,7 @@ jobs:
           version = tomllib.loads(pathlib.Path("codex-rs/Cargo.toml").read_text())["workspace"]["package"]["version"]
 
           assert manifest["version"] == version, manifest
+          assert manifest["forkBuildNumber"] == int(os.environ["CODEX_FORK_BUILD_NUMBER"]), manifest
           assert manifest["target"] == "x86_64-apple-darwin", manifest
           assert manifest["entrypoint"] == "bin/codex", manifest
           for relative in ["bin/codex", "bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg"]:

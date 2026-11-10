@@ -2,11 +2,19 @@ name: Build Windows Codex Binary
 
 on:
   workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Monotonically increasing fork build number (same on both platforms)"
+        required: true
+        default: "1"
+        type: string
 
 jobs:
   build-windows:
     name: Build codex.exe (Windows x64)
     runs-on: windows-latest
+    env:
+      CODEX_FORK_BUILD_NUMBER: ${{ inputs.build_number }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,13 +39,21 @@ jobs:
             --package-dir "$env:RUNNER_TEMP\codex-package" `
             --force
 
+      - name: Stamp fork build number and create distributable ZIP
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP "codex-package"
+          python scripts/fork_release.py stamp --package-dir "$packageDir" --build "$env:CODEX_FORK_BUILD_NUMBER"
+          Compress-Archive -Path (Join-Path $packageDir "*") `
+            -DestinationPath (Join-Path $env:RUNNER_TEMP "codex-windows-x64.zip") -Force
+
       - name: Verify packaged Codex version
         shell: pwsh
         run: |
           $packageDir = Join-Path $env:RUNNER_TEMP "codex-package"
           $manifest = Get-Content (Join-Path $packageDir "codex-package.json") -Raw | ConvertFrom-Json
           $versionOutput = & (Join-Path $packageDir "bin/codex.exe") --version
-          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($manifest.version)) {
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape($manifest.version) -or $manifest.forkBuildNumber -ne [int]$env:CODEX_FORK_BUILD_NUMBER) {
             throw "Packaged codex.exe version '$versionOutput' does not match manifest version '$($manifest.version)'"
           }
 
@@ -45,5 +61,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: codex-windows-x64
-          path: ${{ runner.temp }}/codex-package/
+          path: ${{ runner.temp }}/codex-windows-x64.zip
           if-no-files-found: error
