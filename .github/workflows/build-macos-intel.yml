@@ -18,7 +18,15 @@ jobs:
     runs-on: macos-15-intel
     env:
       CODEX_FORK_BUILD_NUMBER: ${{ inputs.build_number }}
-    timeout-minutes: 180
+      # Preserve release optimizations while avoiding the multi-hour ThinLTO link.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_INCREMENTAL: "0"
+    # The first Intel release build has to compile a very large workspace.
+    # With LTO disabled this can finish much sooner; allow headroom for cold caches.
+    timeout-minutes: 360
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,6 +47,16 @@ jobs:
           test "$(uname -m)" = "x86_64"
           rustc --version
           cargo --version
+
+      - name: Verify fast release profile overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Release LTO: $CARGO_PROFILE_RELEASE_LTO"
+          echo "Codegen units: $CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          echo "Debug level: $CARGO_PROFILE_RELEASE_DEBUG"
+          test "$CARGO_PROFILE_RELEASE_LTO" = "false"
+          test "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" = "16"
 
       - name: Build complete Intel macOS package
         shell: bash

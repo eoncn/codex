@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
-use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;

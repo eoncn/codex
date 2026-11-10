@@ -15,6 +15,10 @@ jobs:
     runs-on: windows-latest
     env:
       CODEX_FORK_BUILD_NUMBER: ${{ inputs.build_number }}
+      # Avoid Windows MAX_PATH while checking out rusty_v8 git submodules.
+      CARGO_HOME: C:\c
+      CARGO_TARGET_DIR: C:\t
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,6 +32,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Enable Git long paths for Rust dependency submodules
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          if ((git config --global --get core.longpaths) -ne "true") {
+            throw "Git long path support could not be enabled"
+          }
+          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:CARGO_TARGET_DIR -Force | Out-Null
+          Write-Host "Cargo uses Git CLI and short cache/target paths"
 
       - name: Build Codex Windows Package
         shell: pwsh
